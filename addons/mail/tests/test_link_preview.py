@@ -4,11 +4,14 @@ from markupsafe import Markup
 from unittest.mock import patch
 
 import io
+import socket
+
 import requests
 
 from odoo.addons.mail.tests.common import MailCommon
 from odoo.addons.mail.tools import link_preview
 from odoo.tests.common import tagged
+from odoo.tools import url_guard
 
 
 @tagged("mail_link_preview", "mail_message", "post_install", "-at_install")
@@ -25,6 +28,14 @@ class TestLinkPreview(MailCommon):
         cls.og_description = 'Test OG description'
         cls.og_image = 'https://dummy-image-url.nothing'
         cls.source_url = 'https://thisdomainedoentexist.nothing'
+
+    def setUp(self):
+        super().setUp()
+        # Neutralise the SSRF guard's host resolution so the mocked transport
+        # (unresolvable fake domains, localhost) is what gets exercised.
+        self.patch(url_guard.socket, 'getaddrinfo', lambda host, port, *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', ('8.8.8.8', port or 80)),
+        ])
 
     def _patch_head_html(self, *args, **kwargs):
         response = requests.Response()
@@ -184,7 +195,7 @@ class TestLinkPreview(MailCommon):
                 self.env["mail.link.preview"]._create_from_message_and_notify(message)
 
     def test_link_preview_no_content_type(self):
-        with patch.object(requests.Session, 'request', self._patch_with_no_content_type):
+        with patch.object(requests.Session, 'get', self._patch_with_no_content_type):
             url = self.source_url
             session = requests.Session()
             link_preview.get_link_preview_from_url(url, session)

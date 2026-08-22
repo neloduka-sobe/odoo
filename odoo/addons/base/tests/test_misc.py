@@ -3,11 +3,14 @@
 import base64
 import datetime
 import os.path
+import socket
+from unittest.mock import patch
 
 import pytz
+import requests
 
 from odoo.tests.common import BaseCase, TransactionCase
-from odoo.tools import config, misc, urls
+from odoo.tools import config, misc, url_guard, urls
 from odoo.tools.mail import validate_url
 from odoo.tools.misc import file_open, file_path, merge_sequences, remove_accents
 
@@ -714,3 +717,98 @@ class TestFormatAmountFunction(TransactionCase):
         # Has no effect on number having same decimal and thousandth seperator - currency position after
         self.currency_object_format_amount.position = "after"
         self.assert_format_amount(10000, "10#000%sfA" % "\N{NO-BREAK SPACE}", False, "GFL")
+
+
+def _resolves_to(*ips):
+    """Fake `socket.getaddrinfo` that always answers with `ips`."""
+    def getaddrinfo(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (ip, port or 80)) for ip in ips]
+    return getaddrinfo
+
+
+class _FakeResponse:
+    """Just enough of a requests.Response for guarded_request to walk redirects."""
+    def __init__(self, status_code, location=None):
+        self.status_code = status_code
+        self.headers = {'Location': location} if location else {}
+        self.is_redirect = self.is_permanent_redirect = location is not None
+
+
+class TestUrlGuard(BaseCase):
+    # The guard sits in front of the link-preview / attachment / forum fetches
+    # so a user-supplied URL cannot make the server hit its own network.
+
+    def test_scheme_must_be_http(self):
+        for url in (
+            'file:///etc/passwd',
+            'gopher://127.0.0.1:6379/_',
+            'dict://127.0.0.1:11211/',
+            'ftp://example.com/x',
+            'http:///no-host',
+        ):
+            with self.subTest(url=url), self.assertRaises(url_guard.UnsafeUrlError):
+                url_guard.validate_public_url(url)
+
+    def test_non_public_addresses_are_refused(self):
+        # loopback, the RFC1918 ranges, link-local (incl. the cloud metadata IP),
+        # CGNAT, the unspecified address and their IPv6 counterparts.
+        for ip in (
+            '127.0.0.1', '10.0.0.5', '172.16.0.1', '192.168.1.1',
+            '169.254.169.254', '100.64.0.1', '0.0.0.0',
+            '::1', 'fd00::1', 'fe80::1', '::ffff:127.0.0.1',
+        ):
+            with self.subTest(ip=ip), patch.object(url_guard.socket, 'getaddrinfo', _resolves_to(ip)):
+                with self.assertRaises(url_guard.UnsafeUrlError):
+                    url_guard.validate_public_url('http://somewhere.test/')
+
+    def test_public_address_passes(self):
+        with patch.object(url_guard.socket, 'getaddrinfo', _resolves_to('8.8.8.8')):
+            self.assertEqual(url_guard.validate_public_url('http://ok.test/'), 'http://ok.test/')
+
+    def test_unresolvable_host_fails_closed(self):
+        def boom(*args, **kwargs):
+            raise socket.gaierror
+        with patch.object(url_guard.socket, 'getaddrinfo', boom):
+            with self.assertRaises(url_guard.UnsafeUrlError):
+                url_guard.validate_public_url('http://nx.test/')
+
+    def test_redirect_target_is_checked_too(self):
+        # The classic bypass: a public URL that 302s onto an internal one.
+        def getaddrinfo(host, port, *args, **kwargs):
+            ip = '8.8.8.8' if host == 'public.test' else '127.0.0.1'
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (ip, port or 80))]
+
+        session = requests.Session()
+        with patch.object(url_guard.socket, 'getaddrinfo', getaddrinfo), \
+             patch.object(session, 'get', lambda url, **kw: _FakeResponse(302, 'http://intranet.test/secret')):
+            with self.assertRaises(url_guard.UnsafeUrlError):
+                url_guard.guarded_get('http://public.test/', session=session)
+
+    def test_redirect_loop_is_bounded_and_allow_redirects_forced_off(self):
+        seen_kwargs = {}
+
+        def get(url, **kwargs):
+            seen_kwargs.update(kwargs)
+            return _FakeResponse(302, 'http://public.test/loop')
+
+        session = requests.Session()
+        with patch.object(url_guard.socket, 'getaddrinfo', _resolves_to('8.8.8.8')), \
+             patch.object(session, 'get', get):
+            with self.assertRaises(url_guard.UnsafeUrlError):
+                # caller asks to follow redirects; the guard must ignore that and
+                # walk them itself, one validation per hop, up to the limit.
+                url_guard.guarded_get('http://public.test/', session=session, allow_redirects=True)
+        self.assertFalse(seen_kwargs.get('allow_redirects'))
+
+    def test_guarded_head_uses_head(self):
+        calls = []
+
+        def head(url, **kwargs):
+            calls.append(url)
+            return _FakeResponse(200)
+
+        session = requests.Session()
+        with patch.object(url_guard.socket, 'getaddrinfo', _resolves_to('8.8.8.8')), \
+             patch.object(session, 'head', head):
+            url_guard.guarded_head('http://ok.test/', session=session)
+        self.assertEqual(calls, ['http://ok.test/'])
